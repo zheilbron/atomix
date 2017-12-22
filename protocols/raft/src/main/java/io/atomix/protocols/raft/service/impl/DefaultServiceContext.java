@@ -74,7 +74,7 @@ public class DefaultServiceContext implements ServiceContext {
   private final ThreadContextFactory threadContextFactory;
   private final LoadMonitor loadMonitor;
   private final Map<Long, PendingSnapshot> pendingSnapshots = new ConcurrentSkipListMap<>();
-  private long snapshotIndex;
+  private volatile long snapshotIndex;
   private long currentIndex;
   private long currentTimestamp;
   private OperationType currentOperation;
@@ -220,24 +220,26 @@ public class DefaultServiceContext implements ServiceContext {
    */
   private void maybeCompleteSnapshot(long index) {
     if (!pendingSnapshots.isEmpty()) {
-      // Compute the lowest completed index for all sessions that belong to this state machine.
-      long lastCompleted = index;
-      for (RaftSessionContext session : sessions.getSessions()) {
-        lastCompleted = Math.min(lastCompleted, session.getLastCompleted());
-      }
+      synchronized (this) {
+        // Compute the lowest completed index for all sessions that belong to this state machine.
+        long lastCompleted = index;
+        for (RaftSessionContext session : sessions.getSessions()) {
+          lastCompleted = Math.min(lastCompleted, session.getLastCompleted());
+        }
 
-      for (PendingSnapshot pendingSnapshot : pendingSnapshots.values()) {
-        Snapshot snapshot = pendingSnapshot.snapshot;
-        if (snapshot.isPersisted()) {
+        for (PendingSnapshot pendingSnapshot : pendingSnapshots.values()) {
+          Snapshot snapshot = pendingSnapshot.snapshot;
+          if (snapshot.isPersisted()) {
 
-          // If the lowest completed index for all sessions is greater than the snapshot index, complete the snapshot.
-          if (lastCompleted >= snapshot.index()) {
-            log.debug("Completing snapshot {}", snapshot.index());
-            snapshot.complete();
+            // If the lowest completed index for all sessions is greater than the snapshot index, complete the snapshot.
+            if (lastCompleted >= snapshot.index()) {
+              log.debug("Completing snapshot {}", snapshot.index());
+              snapshot.complete();
 
-            // Update the snapshot index to ensure we don't simply install the same snapshot.
-            snapshotIndex = snapshot.index();
-            pendingSnapshot.future.complete(null);
+              // Update the snapshot index to ensure we don't simply install the same snapshot.
+              snapshotIndex = snapshot.index();
+              pendingSnapshot.future.complete(null);
+            }
           }
         }
       }
@@ -253,50 +255,55 @@ public class DefaultServiceContext implements ServiceContext {
 
     // If the latest snapshot is non-null, hasn't been installed, and has an index lower than the current index, install it.
     if (snapshot != null && snapshot.index() > snapshotIndex && snapshot.index() < index) {
-      log.debug("Installing snapshot {}", snapshot.index());
-      try (SnapshotReader reader = snapshot.openReader()) {
-        reader.skip(Bytes.LONG); // Skip the service ID
-        ServiceType serviceType = ServiceType.from(reader.readString());
-        String serviceName = reader.readString();
-        int sessionCount = reader.readInt();
-        for (int i = 0; i < sessionCount; i++) {
-          SessionId sessionId = SessionId.from(reader.readLong());
-          MemberId node = MemberId.from(reader.readString());
-          ReadConsistency readConsistency = ReadConsistency.valueOf(reader.readString());
-          long minTimeout = reader.readLong();
-          long maxTimeout = reader.readLong();
-          long sessionTimestamp = reader.readLong();
+      synchronized (this) {
+        snapshot = raft.getSnapshotStore().getSnapshotById(serviceId);
+        if (snapshot != null && snapshot.index() > snapshotIndex && snapshot.index() < index) {
+          log.debug("Installing snapshot {}", snapshot.index());
+          try (SnapshotReader reader = snapshot.openReader()) {
+            reader.skip(Bytes.LONG); // Skip the service ID
+            ServiceType serviceType = ServiceType.from(reader.readString());
+            String serviceName = reader.readString();
+            int sessionCount = reader.readInt();
+            for (int i = 0; i < sessionCount; i++) {
+              SessionId sessionId = SessionId.from(reader.readLong());
+              MemberId node = MemberId.from(reader.readString());
+              ReadConsistency readConsistency = ReadConsistency.valueOf(reader.readString());
+              long minTimeout = reader.readLong();
+              long maxTimeout = reader.readLong();
+              long sessionTimestamp = reader.readLong();
 
-          // Only create a new session if one does not already exist. This is necessary to ensure only a single session
-          // is ever opened and exposed to the state machine.
-          RaftSessionContext session = sessions.addSession(new RaftSessionContext(
-              sessionId,
-              node,
-              serviceName,
-              serviceType,
-              readConsistency,
-              minTimeout,
-              maxTimeout,
-              sessionTimestamp,
-              this,
-              raft,
-              threadContextFactory));
+              // Only create a new session if one does not already exist. This is necessary to ensure only a single session
+              // is ever opened and exposed to the state machine.
+              RaftSessionContext session = sessions.addSession(new RaftSessionContext(
+                  sessionId,
+                  node,
+                  serviceName,
+                  serviceType,
+                  readConsistency,
+                  minTimeout,
+                  maxTimeout,
+                  sessionTimestamp,
+                  this,
+                  raft,
+                  threadContextFactory));
 
-          session.setRequestSequence(reader.readLong());
-          session.setCommandSequence(reader.readLong());
-          session.setEventIndex(reader.readLong());
-          session.setLastCompleted(reader.readLong());
-          session.setLastApplied(snapshot.index());
-          session.setLastUpdated(sessionTimestamp);
-          sessions.openSession(session);
+              session.setRequestSequence(reader.readLong());
+              session.setCommandSequence(reader.readLong());
+              session.setEventIndex(reader.readLong());
+              session.setLastCompleted(reader.readLong());
+              session.setLastApplied(snapshot.index());
+              session.setLastUpdated(sessionTimestamp);
+              sessions.openSession(session);
+            }
+            currentIndex = snapshot.index();
+            currentTimestamp = snapshot.timestamp().unixTimestamp();
+            service.install(reader);
+          } catch (Exception e) {
+            log.error("Snapshot installation failed: {}", e);
+          }
+          snapshotIndex = snapshot.index();
         }
-        currentIndex = snapshot.index();
-        currentTimestamp = snapshot.timestamp().unixTimestamp();
-        service.install(reader);
-      } catch (Exception e) {
-        log.error("Snapshot installation failed: {}", e);
       }
-      snapshotIndex = snapshot.index();
     }
   }
 
@@ -314,54 +321,56 @@ public class DefaultServiceContext implements ServiceContext {
         return;
       }
 
-      // Compute the snapshot index as the greater of the compaction index and the last index applied to this service.
-      long snapshotIndex = Math.max(index, currentIndex);
+      synchronized (this) {
+        // Compute the snapshot index as the greater of the compaction index and the last index applied to this service.
+        long snapshotIndex = Math.max(index, currentIndex);
 
-      // If there's already a snapshot taken at a higher index, skip the snapshot.
-      Snapshot currentSnapshot = raft.getSnapshotStore().getSnapshotById(serviceId);
-      if (currentSnapshot != null && currentSnapshot.index() > index) {
-        return;
-      }
-
-      log.debug("Taking snapshot {}", snapshotIndex);
-
-      // Create a temporary in-memory snapshot buffer.
-      Snapshot snapshot = raft.getSnapshotStore()
-          .newTemporarySnapshot(serviceId, serviceName, snapshotIndex, WallClockTimestamp.from(currentTimestamp));
-
-      // Add the snapshot to the pending snapshots registry.
-      PendingSnapshot pendingSnapshot = new PendingSnapshot(snapshot);
-      pendingSnapshots.put(snapshotIndex, pendingSnapshot);
-      pendingSnapshot.future.whenComplete((r, e) -> pendingSnapshots.remove(snapshotIndex));
-
-      // Serialize sessions to the in-memory snapshot and request a snapshot from the state machine.
-      try (SnapshotWriter writer = snapshot.openWriter()) {
-        writer.writeLong(serviceId.id());
-        writer.writeString(serviceType.id());
-        writer.writeString(serviceName);
-        writer.writeInt(sessions.getSessions().size());
-        for (RaftSessionContext session : sessions.getSessions()) {
-          writer.writeLong(session.sessionId().id());
-          writer.writeString(session.memberId().id());
-          writer.writeString(session.readConsistency().name());
-          writer.writeLong(session.minTimeout());
-          writer.writeLong(session.maxTimeout());
-          writer.writeLong(session.getLastUpdated());
-          writer.writeLong(session.getRequestSequence());
-          writer.writeLong(session.getCommandSequence());
-          writer.writeLong(session.getEventIndex());
-          writer.writeLong(session.getLastCompleted());
+        // If there's already a snapshot taken at a higher index, skip the snapshot.
+        Snapshot currentSnapshot = raft.getSnapshotStore().getSnapshotById(serviceId);
+        if (currentSnapshot != null && currentSnapshot.index() > index) {
+          return;
         }
-        service.snapshot(writer);
-      } catch (Exception e) {
-        log.error("Snapshot failed: {}", e);
-      }
 
-      // Persist the snapshot to disk in a background thread before completing the snapshot future.
-      snapshotExecutor.execute(() -> {
-        pendingSnapshot.persist();
-        future.complete(snapshotIndex);
-      });
+        log.debug("Taking snapshot {}", snapshotIndex);
+
+        // Create a temporary in-memory snapshot buffer.
+        Snapshot snapshot = raft.getSnapshotStore()
+            .newTemporarySnapshot(serviceId, serviceName, snapshotIndex, WallClockTimestamp.from(currentTimestamp));
+
+        // Add the snapshot to the pending snapshots registry.
+        PendingSnapshot pendingSnapshot = new PendingSnapshot(snapshot);
+        pendingSnapshots.put(snapshotIndex, pendingSnapshot);
+        pendingSnapshot.future.whenComplete((r, e) -> pendingSnapshots.remove(snapshotIndex));
+
+        // Serialize sessions to the in-memory snapshot and request a snapshot from the state machine.
+        try (SnapshotWriter writer = snapshot.openWriter()) {
+          writer.writeLong(serviceId.id());
+          writer.writeString(serviceType.id());
+          writer.writeString(serviceName);
+          writer.writeInt(sessions.getSessions().size());
+          for (RaftSessionContext session : sessions.getSessions()) {
+            writer.writeLong(session.sessionId().id());
+            writer.writeString(session.memberId().id());
+            writer.writeString(session.readConsistency().name());
+            writer.writeLong(session.minTimeout());
+            writer.writeLong(session.maxTimeout());
+            writer.writeLong(session.getLastUpdated());
+            writer.writeLong(session.getRequestSequence());
+            writer.writeLong(session.getCommandSequence());
+            writer.writeLong(session.getEventIndex());
+            writer.writeLong(session.getLastCompleted());
+          }
+          service.snapshot(writer);
+        } catch (Exception e) {
+          log.error("Snapshot failed: {}", e);
+        }
+
+        // Persist the snapshot to disk in a background thread before completing the snapshot future.
+        snapshotExecutor.execute(() -> {
+          pendingSnapshot.persist();
+          future.complete(snapshotIndex);
+        });
+      }
     });
     return future;
   }
